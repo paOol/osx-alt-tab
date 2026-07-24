@@ -5,6 +5,7 @@ import ApplicationServices
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let switcher = SwitcherController()
     private let hotKeys = HotKeyManager()
+    private let passthrough = PassthroughPolicy()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -15,6 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        passthrough.start()
         wireHotKeys()
 
         if !hotKeys.start() {
@@ -29,6 +31,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func wireHotKeys() {
+        hotKeys.shouldPassThrough = { [weak self] in
+            self?.passthrough.shouldPassThrough() ?? false
+        }
         hotKeys.onOpenOrNext = { [weak self] in
             Task { @MainActor in self?.switcher.openOrNext() }
         }

@@ -7,11 +7,18 @@ import CoreGraphics
 ///   • ⌥+Shift+Tab    → advance selection backward
 ///   • release ⌥      → commit (activate the selected window)
 ///   • Esc            → cancel
+///
+/// When `shouldPassThrough` says the frontmost app owns Alt+Tab (a remote-desktop
+/// or VM client running another OS), the chord is forwarded untouched — except
+/// for ⌃⌥+Tab, which always drives the local switcher as an escape hatch.
 final class HotKeyManager {
     var onOpenOrNext: (() -> Void)?
     var onPrev: (() -> Void)?
     var onCommit: (() -> Void)?
     var onCancel: (() -> Void)?
+
+    /// Consulted on every ⌥+Tab; return true to let the focused app have it.
+    var shouldPassThrough: (() -> Bool)?
 
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -55,11 +62,18 @@ final class HotKeyManager {
         let flags = event.flags
         let optionDown = flags.contains(.maskAlternate)
         let shiftDown = flags.contains(.maskShift)
+        let controlDown = flags.contains(.maskControl)
 
         switch type {
         case .keyDown:
             let keycode = event.getIntegerValueField(.keyboardEventKeycode)
             if keycode == tabKey && optionDown {
+                // A remote session/VM is focused: the guest OS owns Alt+Tab.
+                // ⌃⌥+Tab still opens the local switcher so fullscreen clients
+                // can't trap you.
+                if !isShowing && !controlDown && shouldPassThrough?() == true {
+                    return Unmanaged.passUnretained(event)
+                }
                 if !isShowing {
                     isShowing = true
                     onOpenOrNext?()

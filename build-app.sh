@@ -1,6 +1,11 @@
 #!/bin/bash
 # Builds AltTabClone.app — a proper macOS app bundle that can hold
 # Accessibility / Screen Recording permissions stably.
+#
+# The bundle is staged inside .build/ rather than the project root, so the only
+# app at a launchable, Spotlight-visible path is the one ./install.sh puts in
+# ~/Applications. Two copies would mean two entries in the Accessibility list
+# and no way to tell which one is running.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -8,7 +13,11 @@ cd "$(dirname "$0")"
 CONFIG="${1:-release}"
 APP_NAME="AltTabClone"
 BUILD_DIR=".build/${CONFIG}"
-APP_BUNDLE="${APP_NAME}.app"
+APP_BUNDLE=".build/${APP_NAME}.app"
+
+# Older revisions of this script staged the bundle in the project root; drop any
+# leftover so it can't shadow the installed copy.
+rm -rf "${APP_NAME}.app"
 
 echo "==> Building (${CONFIG})…"
 swift build -c "${CONFIG}"
@@ -31,6 +40,5 @@ codesign --force --deep --sign - \
 
 echo "==> Done: $(pwd)/${APP_BUNDLE}"
 echo ""
-echo "Launch it with:  open ${APP_BUNDLE}"
-echo "On first run, grant Accessibility access in"
-echo "System Settings → Privacy & Security → Accessibility, then relaunch."
+echo "This is a staging copy. Install it (single copy in ~/Applications,"
+echo "runs at login) with:  ./install.sh"
