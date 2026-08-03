@@ -89,8 +89,50 @@ On first launch macOS will ask for two permissions:
    thumbnails. If you decline, the switcher still works and falls back to large
    app icons.
 
-The app is ad-hoc code-signed with a stable bundle identifier
-(`com.alttabclone.app`) so these permissions persist across rebuilds.
+### Why permissions must be signed to stick
+
+macOS attaches a permission grant to the app's **designated requirement** — a
+rule it stores when you grant access and re-evaluates on every launch.
+
+An ad-hoc signature gets a default requirement that is nothing but the binary's
+own hash:
+
+```
+cdhash H"<binary hash>"
+```
+
+Relinking changes that hash, so every rebuild silently invalidates the grant.
+The failure mode is easy to misread: the app still appears **checked**
+in System Settings but is not actually trusted, and un-checking and re-checking
+it does _not_ help, because System Settings rewrites the row from the stale
+requirement it already stored.
+
+`build-app.sh` avoids this by passing the requirement to `codesign` explicitly
+(`-r=`), pinning it to the bundle identifier instead of the hash:
+
+```
+designated => identifier "com.alttabclone.app"
+```
+
+That survives rebuilds, so you grant Accessibility once and it holds — with no
+certificate, no keychain and no setup step. The build fails loudly if the
+requirement ever comes out hash-based again.
+
+The tradeoff is that a requirement this loose is satisfied by any ad-hoc binary
+claiming this bundle identifier, so the grant isn't bound to this build in
+particular. That's a reasonable trade for a locally-built personal tool; an app
+distributed to other people should sign with a real Developer ID certificate,
+which is both stable _and_ bound to the signer.
+
+If you land in that state, remove the entry with the **–** button in
+**System Settings → Privacy & Security → Accessibility**, or run:
+
+```bash
+tccutil reset Accessibility com.alttabclone.app
+```
+
+then relaunch and grant it again. `install.sh` does this automatically whenever
+it detects that the signing identity changed.
 
 ## How it works
 

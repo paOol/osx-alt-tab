@@ -21,10 +21,36 @@ STAGED_APP=".build/${APP_NAME}.app"
 echo "==> Building app bundle…"
 ./build-app.sh release
 
+# Record what the currently-installed copy was signed with, before replacing it.
+# codesign prints an implicit requirement as "# designated => …" and an explicit
+# one as "designated => …", so strip the marker before comparing — otherwise the
+# two forms always look different and this would reset permissions every time.
+designated_requirement() {
+    codesign -d -r- "$1" 2>&1 | sed -n 's/^#* *designated => //p'
+}
+
+OLD_REQ=""
+if [ -d "${INSTALLED_APP}" ]; then
+    OLD_REQ="$(designated_requirement "${INSTALLED_APP}")"
+fi
+NEW_REQ="$(designated_requirement "${STAGED_APP}")"
+
 echo "==> Installing to ${INSTALLED_APP}…"
 mkdir -p "${INSTALL_DIR}"
 rm -rf "${INSTALLED_APP}"
 cp -R "${STAGED_APP}" "${INSTALLED_APP}"
+
+# If the designated requirement changed, any existing TCC grant is now stale:
+# the app still appears (checked) in System Settings but is not actually
+# trusted, and toggling the checkbox won't help because System Settings rewrites
+# the row from the stale stored requirement. Clearing the entry is the only way
+# to get a working prompt again.
+if [ -n "${OLD_REQ}" ] && [ "${OLD_REQ}" != "${NEW_REQ}" ]; then
+    echo "==> Signing identity changed — clearing the stale permission entry…"
+    tccutil reset Accessibility "${LABEL}" >/dev/null 2>&1 || true
+    tccutil reset ScreenCapture "${LABEL}" >/dev/null 2>&1 || true
+    echo "    You will need to grant Accessibility access once more."
+fi
 
 # Some Macs also have a stray copy in /Applications from a manual drag; leaving
 # it there means a second Accessibility entry and a second app at login.

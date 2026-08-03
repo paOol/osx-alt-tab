@@ -30,13 +30,42 @@ mkdir -p "${APP_BUNDLE}/Contents/Resources"
 cp "${BUILD_DIR}/${APP_NAME}" "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
 cp "Resources/Info.plist" "${APP_BUNDLE}/Contents/Info.plist"
 
-# Ad-hoc code signature with a stable identifier. macOS ties TCC permissions
-# (Accessibility, Screen Recording) to the signed bundle identity, so a stable
-# ad-hoc signature means permissions survive rebuilds instead of resetting.
-echo "==> Code signing (ad-hoc)…"
-codesign --force --deep --sign - \
-    --identifier "com.alttabclone.app" \
+# macOS ties TCC permissions (Accessibility, Screen Recording) to the app's
+# *designated requirement* — the rule it stores at grant time and re-evaluates
+# on every launch. By default an ad-hoc signature gets
+#     cdhash H"<binary hash>"
+# which changes on every relink, so each rebuild silently invalidates the grant:
+# the app still shows as checked in System Settings but isn't actually trusted.
+#
+# Supplying the requirement explicitly pins it to the bundle identifier instead,
+# which is stable across rebuilds. That means no certificate, no keychain and no
+# setup step — grant Accessibility once and it holds for every future build.
+#
+# The tradeoff: a requirement this loose is satisfied by *any* ad-hoc binary
+# claiming this identifier, so the grant isn't bound to this build in particular.
+# For a locally-built personal tool that's an acceptable trade; an app shipped to
+# other people should use a real Developer ID certificate, which gets both
+# stability and binding.
+BUNDLE_ID="com.alttabclone.app"
+DESIGNATED_REQUIREMENT="designated => identifier \"${BUNDLE_ID}\""
+
+echo "==> Code signing (ad-hoc, identifier-pinned)…"
+codesign --force --sign - \
+    --identifier "${BUNDLE_ID}" \
+    -r="${DESIGNATED_REQUIREMENT}" \
     "${APP_BUNDLE}"
+
+echo "==> Designated requirement:"
+codesign -d -r- "${APP_BUNDLE}" 2>&1 | grep '^designated' | sed 's/^/    /'
+
+# Guard against a silent regression here: if this ever emits a cdhash-based
+# requirement again, permissions would start resetting on every rebuild and the
+# only symptom would be the confusing "already enabled but keeps asking" loop.
+if ! codesign --verify -R="identifier \"${BUNDLE_ID}\"" "${APP_BUNDLE}" 2>/dev/null; then
+    echo "!!! Designated requirement is not identifier-pinned." >&2
+    echo "!!! Accessibility permission will reset on every rebuild." >&2
+    exit 1
+fi
 
 echo "==> Done: $(pwd)/${APP_BUNDLE}"
 echo ""
