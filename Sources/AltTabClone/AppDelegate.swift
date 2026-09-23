@@ -3,62 +3,88 @@ import ApplicationServices
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let switcher = SwitcherController()
+    private let focus = FocusTracker()
+    private lazy var switcher = SwitcherController(focus: focus)
     private let hotKeys = HotKeyManager()
     private let passthrough = PassthroughPolicy()
+    private var permissionTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        AXTimeouts.install()
 
-        guard ensureAccessibilityPermission() else {
-            // The trust prompt has been shown; the user must grant access and relaunch.
-            presentPermissionGuidance()
-            return
+        if AXIsProcessTrusted() {
+            start()
+        } else {
+            Log.app.info("waiting for Accessibility permission")
+            waitForAccessibilityPermission()
         }
+    }
 
+    private func start() {
         passthrough.start()
+        focus.start()
         wireHotKeys()
 
-        if !hotKeys.start() {
+        let tapStarted = hotKeys.start()
+        Log.app.info("started; event tap \(tapStarted ? "installed" : "FAILED", privacy: .public)")
+        if !tapStarted {
             presentAlert(
                 title: "Couldn't start AltTabClone",
                 message: "Failed to install the keyboard event tap. Make sure AltTabClone has Accessibility permission in System Settings → Privacy & Security → Accessibility, then relaunch."
             )
+            return
         }
 
-        // Warm up Screen Recording permission so thumbnails work on first use.
-        CGRequestScreenCaptureAccess()
+        // Ask for Screen Recording (thumbnails) once; later launches don't re-prompt.
+        if !CGPreflightScreenCaptureAccess() {
+            CGRequestScreenCaptureAccess()
+        }
     }
 
     private func wireHotKeys() {
-        hotKeys.shouldPassThrough = { [weak self] in
-            self?.passthrough.shouldPassThrough() ?? false
+        hotKeys.shouldPassThrough = { [passthrough] in
+            passthrough.shouldPassThrough()
         }
-        hotKeys.onOpenOrNext = { [weak self] in
-            Task { @MainActor in self?.switcher.openOrNext() }
+        hotKeys.sameAppShortcutEnabled = {
+            Settings.load().sameAppShortcut
         }
-        hotKeys.onPrev = { [weak self] in
-            Task { @MainActor in self?.switcher.previous() }
+        hotKeys.onCommand = { [weak self] command in
+            MainActor.assumeIsolated { self?.switcher.handle(command) }
         }
-        hotKeys.onCommit = { [weak self] in
-            Task { @MainActor in self?.switcher.commit() }
-        }
-        hotKeys.onCancel = { [weak self] in
-            Task { @MainActor in self?.switcher.cancel() }
+        switcher.onSessionEnded = { [hotKeys] in
+            hotKeys.sessionEnded()
         }
     }
 
     // MARK: - Permissions
 
-    private func ensureAccessibilityPermission() -> Bool {
+    /// Show the system prompt plus our guidance, then poll until access is
+    /// granted and start on our own — no relaunch needed.
+    private func waitForAccessibilityPermission() {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        return AXIsProcessTrustedWithOptions(options)
-    }
+        _ = AXIsProcessTrustedWithOptions(options)
 
-    private func presentPermissionGuidance() {
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] timer in
+            guard AXIsProcessTrusted() else { return }
+            timer.invalidate()
+            MainActor.assumeIsolated {
+                self?.permissionTimer = nil
+                // Dismiss the guidance alert if it's still up.
+                if NSApp.modalWindow != nil {
+                    NSApp.abortModal()
+                }
+                self?.start()
+            }
+        }
+        // `.common` includes the modal panel mode, so this keeps firing while
+        // the alert below is on screen.
+        RunLoop.main.add(timer, forMode: .common)
+        permissionTimer = timer
+
         presentAlert(
             title: "Accessibility permission needed",
-            message: "AltTabClone needs Accessibility access to switch windows.\n\nGrant it in System Settings → Privacy & Security → Accessibility, then relaunch AltTabClone."
+            message: "AltTabClone needs Accessibility access to switch windows.\n\nGrant it in System Settings → Privacy & Security → Accessibility. AltTabClone will start automatically once access is granted."
         )
     }
 
@@ -70,5 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.informativeText = message
         alert.addButton(withTitle: "OK")
         alert.runModal()
+        // Back to a Dock-less agent once the alert is gone.
+        NSApp.setActivationPolicy(.accessory)
     }
 }

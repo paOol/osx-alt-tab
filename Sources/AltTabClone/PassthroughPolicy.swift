@@ -1,3 +1,4 @@
+import AltTabCore
 import AppKit
 
 /// Decides when the switcher should step aside and let the frontmost app receive
@@ -15,12 +16,14 @@ import AppKit
 ///     defaults write com.alttabclone.app PassthroughEnabled -bool false
 ///
 /// Entries are matched case-insensitively as substrings of the frontmost app's
-/// bundle identifier *or* its name, so a bare "moonlight" is enough.
+/// bundle identifier *or* its name, so a bare "moonlight" is enough. Both keys
+/// are re-read on every ⌥+Tab, so changes apply without a relaunch.
+///
 /// `@unchecked Sendable`: the mutable frontmost-app cache is lock-protected, and
-/// everything else is immutable after `init`.
+/// `UserDefaults` is thread-safe.
 final class PassthroughPolicy: @unchecked Sendable {
-    static let enabledKey = "PassthroughEnabled"
-    static let appsKey = "PassthroughApps"
+    static let enabledKey = Settings.passthroughEnabledKey
+    static let appsKey = Settings.passthroughAppsKey
 
     /// Shipping defaults: the common streaming / remote-desktop / VM clients.
     static let defaultApps: [String] = [
@@ -43,13 +46,10 @@ final class PassthroughPolicy: @unchecked Sendable {
     private var frontmostName = ""
     private var observer: NSObjectProtocol?
 
-    private let enabled: Bool
-    private let needles: [String]
+    private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {
-        enabled = defaults.object(forKey: Self.enabledKey) as? Bool ?? true
-        let configured = defaults.stringArray(forKey: Self.appsKey) ?? Self.defaultApps
-        needles = configured.map { $0.lowercased() }.filter { !$0.isEmpty }
+        self.defaults = defaults
     }
 
     deinit {
@@ -77,13 +77,14 @@ final class PassthroughPolicy: @unchecked Sendable {
     /// Called from the event-tap callback, hence the lock around the cached
     /// identity rather than a `NSWorkspace` lookup on the input hot path.
     func shouldPassThrough() -> Bool {
-        guard enabled, !needles.isEmpty else { return false }
+        guard defaults.object(forKey: Self.enabledKey) as? Bool ?? true else { return false }
+        let matcher = AppMatcher(patterns: defaults.stringArray(forKey: Self.appsKey) ?? Self.defaultApps)
+        guard !matcher.isEmpty else { return false }
         lock.lock()
         let bundleID = frontmostBundleID
         let name = frontmostName
         lock.unlock()
-        guard !bundleID.isEmpty || !name.isEmpty else { return false }
-        return needles.contains { bundleID.contains($0) || name.contains($0) }
+        return matcher.matches(bundleID: bundleID, name: name)
     }
 
     /// Name of the frontmost app, for logging/diagnostics.

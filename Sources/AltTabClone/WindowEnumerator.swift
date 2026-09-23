@@ -1,97 +1,121 @@
+import AltTabCore
 import AppKit
 import ApplicationServices
 
-/// Enumerates on-screen application windows and orders them
-/// most-recently-used first, the way Windows' Alt+Tab does.
+/// Enumerates application windows — on-screen, minimized, hidden and on other
+/// Spaces — and orders them most-recently-used first, the way Windows' Alt+Tab
+/// does.
+@MainActor
 enum WindowEnumerator {
 
-    /// Most-recently-used window-id order, newest first. Seeded from z-order and
-    /// then maintained as the user switches windows so the second-most-recent
-    /// window (index 1) is the default Alt+Tab target.
-    private static var mruOrder: [CGWindowID] = []
-
-    /// Record that a window was just focused, moving it to the front of the MRU list.
-    static func markUsed(_ windowID: CGWindowID) {
-        mruOrder.removeAll { $0 == windowID }
-        mruOrder.insert(windowID, at: 0)
-    }
-
     /// Returns the current switchable windows in MRU order.
-    static func list() -> [WindowInfo] {
+    static func list(filter: WindowFilter, focus: FocusTracker) -> [WindowInfo] {
         let ownPID = ProcessInfo.processInfo.processIdentifier
+        let regularApps = Dictionary(
+            NSWorkspace.shared.runningApplications
+                .filter { $0.activationPolicy == .regular }
+                .map { ($0.processIdentifier, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
 
-        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        // `.optionAll` includes windows that are minimized, hidden or on other
+        // Spaces. On-screen windows come first, front-to-back.
+        let options: CGWindowListOption = [.optionAll, .excludeDesktopElements]
         guard let raw = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
             return []
         }
 
-        // CGWindowListCopyWindowInfo returns windows front-to-back. Collect the
-        // normal-layer windows along with their owning pid, preserving that z-order.
-        var zOrdered: [(id: CGWindowID, pid: pid_t)] = []
+        struct Candidate {
+            let id: CGWindowID
+            let pid: pid_t
+            let bounds: CGRect
+            let isOnscreen: Bool
+        }
+
+        var candidates: [Candidate] = []
         for dict in raw {
             guard let layer = dict[kCGWindowLayer as String] as? Int, layer == 0,
                   let id = dict[kCGWindowNumber as String] as? CGWindowID,
                   let pid = dict[kCGWindowOwnerPID as String] as? pid_t,
-                  pid != ownPID else { continue }
+                  pid != ownPID, regularApps[pid] != nil else { continue }
 
-            // Skip windows too small to be a real top-level window (sheets, popovers, shadows).
-            if let bounds = dict[kCGWindowBounds as String] as? [String: CGFloat],
-               let w = bounds["Width"], let h = bounds["Height"], w < 80 || h < 80 {
-                continue
+            var bounds = CGRect.zero
+            if let boundsDict = dict[kCGWindowBounds as String] as? NSDictionary,
+               let parsed = CGRect(dictionaryRepresentation: boundsDict as CFDictionary) {
+                bounds = parsed
             }
-            zOrdered.append((id, pid))
+            // Skip windows too small to be a real top-level window (sheets, popovers, shadows).
+            if bounds.width < 80 || bounds.height < 80 { continue }
+
+            let isOnscreen = dict[kCGWindowIsOnscreen as String] as? Bool ?? false
+            candidates.append(Candidate(id: id, pid: pid, bounds: bounds, isOnscreen: isOnscreen))
         }
 
         // Map each pid to its AX windows once (keyed by CGWindowID) to avoid
         // re-querying the accessibility tree per window.
         var axByPID: [pid_t: [CGWindowID: AXUIElement]] = [:]
-        let runningByPID = Dictionary(
-            NSWorkspace.shared.runningApplications.map { ($0.processIdentifier, $0) },
-            uniquingKeysWith: { first, _ in first }
-        )
-
         var byID: [CGWindowID: WindowInfo] = [:]
-        for entry in zOrdered {
-            if axByPID[entry.pid] == nil {
-                axByPID[entry.pid] = axWindows(for: entry.pid)
+        var switchableIDs: [CGWindowID] = []
+
+        for candidate in candidates {
+            if axByPID[candidate.pid] == nil {
+                axByPID[candidate.pid] = axWindows(for: candidate.pid)
             }
-            guard let axElement = axByPID[entry.pid]?[entry.id] else { continue }
+            var axElement = axByPID[candidate.pid]?[candidate.id]
+            if axElement == nil && !candidate.isOnscreen {
+                // Probably on another Space: use the background cache, and
+                // refresh it if this window isn't in there yet.
+                axElement = OtherSpaceWindowFinder.shared.windows(for: candidate.pid)[candidate.id]
+                if axElement == nil {
+                    OtherSpaceWindowFinder.shared.scan(candidate.pid)
+                }
+            }
+            // Off-screen candidates include lots of invisible helper windows,
+            // so hold them to the strict test.
+            guard let axElement,
+                  candidate.isOnscreen ? axElement.isVisibleSwitchableWindow : axElement.isStandardWindow
+            else { continue }
+            switchableIDs.append(candidate.id)
 
-            let app = runningByPID[entry.pid]
-            let appName = app?.localizedName ?? "Unknown"
-            let title = axElement.stringAttribute(kAXTitleAttribute) ?? ""
-
-            byID[entry.id] = WindowInfo(
-                id: entry.id,
-                pid: entry.pid,
+            let app = regularApps[candidate.pid]
+            let isMinimized = axElement.boolAttribute(kAXMinimizedAttribute) ?? false
+            let isAppHidden = app?.isHidden ?? false
+            let window = WindowInfo(
+                id: candidate.id,
+                pid: candidate.pid,
                 axElement: axElement,
-                appName: appName,
-                title: title,
+                appName: app?.localizedName ?? "Unknown",
+                bundleID: app?.bundleIdentifier,
+                title: axElement.stringAttribute(kAXTitleAttribute) ?? "",
                 appIcon: app?.icon,
-                thumbnail: nil
+                bounds: candidate.bounds,
+                isMinimized: isMinimized,
+                isAppHidden: isAppHidden,
+                isOnOtherSpace: !candidate.isOnscreen && !isMinimized && !isAppHidden
             )
+
+            let traits = WindowTraits(
+                bundleID: window.bundleID,
+                appName: window.appName,
+                bounds: window.bounds,
+                isMinimized: window.isMinimized,
+                isAppHidden: window.isAppHidden,
+                isOnOtherSpace: window.isOnOtherSpace
+            )
+            if filter.includes(traits) {
+                byID[candidate.id] = window
+            }
         }
 
-        // Order by our maintained MRU list; any window not yet seen falls back to
-        // z-order. Then prune MRU ids that no longer exist.
-        let zOrder = zOrdered.map(\.id)
-        reconcileMRU(present: zOrder)
-
-        let ordered = mruOrder.compactMap { byID[$0] }
-        return ordered
+        // Order by the tracked MRU list; windows never seen focused fall back to
+        // z-order (on-screen first) after the known ones. Reconcile against all
+        // real windows, not just the filtered ones, so filters don't erase history.
+        let order = focus.order(present: switchableIDs)
+        return order.compactMap { byID[$0] }
     }
 
-    /// Merge freshly seen windows into the MRU list (new ones appended in z-order)
-    /// and drop windows that have since closed.
-    private static func reconcileMRU(present: [CGWindowID]) {
-        let presentSet = Set(present)
-        mruOrder.removeAll { !presentSet.contains($0) }
-        for id in present where !mruOrder.contains(id) {
-            mruOrder.append(id)
-        }
-    }
-
-    /// All on-screen, non-minimized windows of an app, keyed by CGWindowID.
+    /// All windows of an app on the current Space (including minimized ones),
+    /// keyed by CGWindowID.
     private static func axWindows(for pid: pid_t) -> [CGWindowID: AXUIElement] {
         let appElement = AXUIElementCreateApplication(pid)
         var value: CFTypeRef?
@@ -102,28 +126,10 @@ enum WindowEnumerator {
 
         var result: [CGWindowID: AXUIElement] = [:]
         for window in windows {
-            // Skip minimized windows — they aren't in the on-screen CGWindowList anyway.
-            if window.boolAttribute(kAXMinimizedAttribute) == true { continue }
             if let id = window.cgWindowID {
                 result[id] = window
             }
         }
         return result
-    }
-}
-
-// MARK: - AXUIElement attribute helpers
-
-extension AXUIElement {
-    func stringAttribute(_ attribute: String) -> String? {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(self, attribute as CFString, &value) == .success else { return nil }
-        return value as? String
-    }
-
-    func boolAttribute(_ attribute: String) -> Bool? {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(self, attribute as CFString, &value) == .success else { return nil }
-        return (value as? Bool)
     }
 }

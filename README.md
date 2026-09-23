@@ -11,19 +11,62 @@ previews, most-recently-used ordering, and quick flip-back.
 | ---------------------------------- | --------------------------------------------------- |
 | **⌥ Tab** (hold ⌥, tap Tab)        | Open the switcher and highlight the previous window |
 | **⌥ Tab Tab …** (keep tapping Tab) | Move the highlight forward through windows          |
-| **⌥ ⇧ Tab**                        | Move the highlight backward                         |
+| **⌥ ⇧ Tab**                        | Open on the last window / move backward             |
+| **⌥ \`**                           | Same, but only the frontmost app's windows          |
 | **Release ⌥**                      | Switch to the highlighted window                    |
 | **Quick ⌥+Tab tap**                | Instantly flip to the most-recent window            |
+| **← → ↑ ↓** (while open)           | Move the highlight around the grid                  |
+| **Return** (while open)            | Switch to the highlighted window                    |
+| **W** (while open)                 | Close the highlighted window                        |
+| **M** (while open)                 | Minimize / restore the highlighted window           |
+| **H** (while open)                 | Hide / unhide the highlighted window's app          |
+| **Q** (while open)                 | Quit the highlighted window's app                   |
 | **Esc** (while open)               | Cancel without switching                            |
-| **Click a thumbnail**              | Switch to that window                               |
+| **Hover / click a thumbnail**      | Highlight / switch to that window                   |
 | **⌃ ⌥ Tab**                        | Force the local switcher, even in a remote session  |
+
+While the switcher is open, every key goes to the switcher — nothing leaks
+through to the app underneath. W/M/H/Q follow your keyboard layout.
 
 On a Mac keyboard the **⌥ Option key is the Alt key**, so the chord is
 physically identical to Windows' Alt+Tab.
 
 Windows are listed **most-recently-used first**, so the second item is always the
 window you were just on — letting a quick tap flip between two windows exactly
-like Windows.
+like Windows. Focus changes made any other way (⌘+Tab, clicking, the Dock,
+Mission Control) count too.
+
+Minimized windows, windows of hidden (⌘H) apps, and windows on other Spaces —
+including fullscreen apps — are listed with a small badge. Selecting one
+restores it and switches to it.
+
+The overlay waits ~120 ms before appearing, so a quick flip switches without
+flashing the panel. Pressing Tab again shows it immediately.
+
+## Settings
+
+All settings are optional `defaults` keys, applied from the next ⌥+Tab — no
+relaunch needed:
+
+| Key                     | Type         | Default | Effect                                              |
+| ----------------------- | ------------ | ------- | --------------------------------------------------- |
+| `ShowMinimizedWindows`  | bool         | `true`  | List minimized windows                              |
+| `ShowHiddenApps`        | bool         | `true`  | List windows of apps hidden with ⌘H                 |
+| `ShowOtherSpaces`       | bool         | `true`  | List windows on other Spaces / fullscreen apps      |
+| `CurrentScreenOnly`     | bool         | `false` | Only list windows on the screen under the mouse     |
+| `ExcludedApps`          | string array | empty   | Never list these apps (bundle ID or name substring) |
+| `ShowDelayMilliseconds` | number       | `120`   | Delay before the overlay appears (`0` = immediate)  |
+| `ThumbnailWidth`        | number       | `200`   | Thumbnail width in points (80–600)                  |
+| `SameAppShortcut`       | bool         | `true`  | Enable ⌥+\` (turn off if you type accents with it)  |
+| `PassthroughEnabled`    | bool         | `true`  | See [Remote sessions and VMs](#remote-sessions-and-vms-moonlight-parsec-rdp-parallels-) |
+| `PassthroughApps`       | string array | built-in list | 〃                                             |
+
+```bash
+defaults write com.alttabclone.app ExcludedApps -array finder "system settings"
+defaults write com.alttabclone.app ShowOtherSpaces -bool false
+defaults write com.alttabclone.app ShowDelayMilliseconds -int 0
+defaults delete com.alttabclone.app ThumbnailWidth   # back to default
+```
 
 ## Remote sessions and VMs (Moonlight, Parsec, RDP, Parallels …)
 
@@ -54,9 +97,7 @@ defaults delete com.alttabclone.app PassthroughApps
 defaults write com.alttabclone.app PassthroughEnabled -bool false
 ```
 
-Settings are read at launch, so restart the app after changing them
-(`launchctl kickstart -k gui/$UID/com.alttabclone.app` if you installed the
-LaunchAgent).
+Changes apply from the next ⌥+Tab.
 
 ## Build & run
 
@@ -78,13 +119,21 @@ swift build
 .build/debug/AltTabClone
 ```
 
+Unit tests cover the pure logic in `AltTabCore` (MRU ordering, selection,
+filtering, app matching):
+
+```bash
+swift test
+```
+
 ## Permissions
 
 On first launch macOS will ask for two permissions:
 
 1. **Accessibility** — _required._ Used to enumerate windows, read titles, and
    raise the chosen window. Grant it in
-   **System Settings → Privacy & Security → Accessibility**, then **relaunch**.
+   **System Settings → Privacy & Security → Accessibility**; the app notices
+   within a second and starts on its own.
 2. **Screen Recording** — _optional._ Used only to render live window
    thumbnails. If you decline, the switcher still works and falls back to large
    app icons.
@@ -136,23 +185,37 @@ it detects that the signing identity changed.
 
 ## How it works
 
-- **`WindowEnumerator`** — pulls the on-screen window list from
-  `CGWindowListCopyWindowInfo` (which gives front-to-back z-order), correlates
-  each entry with its `AXUIElement` via the `_AXUIElementGetWindow` SPI, and
-  maintains a most-recently-used ordering.
-- **`HotKeyManager`** — a `CGEventTap` that intercepts the ⌥+Tab chord globally,
-  swallowing Tab so the focused app never sees it, and commits on ⌥ release.
+- **`WindowEnumerator`** — pulls every window from `CGWindowListCopyWindowInfo`
+  (on-screen ones first, in front-to-back z-order), correlates each entry with
+  its `AXUIElement` via the `_AXUIElementGetWindow` SPI, keeps only real
+  top-level windows (standard/dialog subrole), and applies the filters.
+- **`OtherSpaceWindowFinder`** — the public AX API only reports windows on the
+  current Space, so windows on other Spaces are found in the background via the
+  `_AXUIElementCreateWithRemoteToken` SPI and cached (refreshed on Space
+  changes).
+- **`FocusTracker`** — maintains the most-recently-used order from app
+  activations and per-app `AXObserver` focused-window notifications.
+- **`HotKeyManager`** — a `CGEventTap` on its own thread (so a busy main
+  thread never adds typing latency) that intercepts ⌥+Tab globally, swallows
+  every key while the switcher is open, and commits on ⌥ release. A watchdog
+  in the controller finishes the session if a release is ever missed.
+- **`AltTabCore`** — AppKit-free logic (MRU list, selection math, filters),
+  unit tested.
+- Every Accessibility call is capped at 250 ms, so a hung app can't freeze the
+  switcher.
 - **`PassthroughPolicy`** — caches the frontmost app (via
   `NSWorkspace.didActivateApplicationNotification`, so the input hot path stays
   lock-and-compare only) and tells the tap when to forward ⌥+Tab to a remote
   session or VM instead of handling it.
-- **`ThumbnailProvider`** — captures window previews asynchronously with
-  ScreenCaptureKit (`SCScreenshotManager`).
+- **`ThumbnailProvider`** — captures window previews in parallel with
+  ScreenCaptureKit (`SCScreenshotManager`), sized to what's displayed. The last
+  preview of each window is cached and shown instantly on the next open.
 - **`SwitcherController` + `SwitcherView`** — a borderless, non-activating
   `NSPanel` hosting a SwiftUI overlay; non-activating so switching focus to the
   target window is clean.
-- **`WindowActivator`** — raises the selected window (`kAXRaiseAction`) and
-  activates its owning application.
+- **`WindowActivator`** — makes the owning app frontmost through
+  Accessibility (not subject to macOS 14's cooperative activation), then raises
+  the selected window, un-hiding or un-minimizing it first.
 
 ## Run it at login
 
@@ -188,7 +251,9 @@ auto-restart it if it crashes — the LaunchAgent does.)
 
 ## Notes / limitations
 
-- Shows on-screen windows. Minimized windows are un-minimized when selected but
-  aren't listed while hidden (a future enhancement).
+- A window on another Space that has never been seen may take one extra ⌥+Tab
+  to appear: it's discovered in the background the first time it's missed.
+- Minimized windows show their last cached preview (or the app icon), since
+  macOS can't capture them while minimized.
 - Uses **⌥+Tab** rather than overriding the system's **⌘+Tab**, so it coexists
   with macOS's built-in app switcher instead of fighting it.
